@@ -91,9 +91,21 @@ async fn run() -> Result<()> {
                 eprintln!("Error: --workers must be greater than zero");
                 std::process::exit(1);
             }
+            if upload_args.client_shards == Some(0) {
+                eprintln!("Error: --client-shards must be greater than zero");
+                std::process::exit(1);
+            }
 
-            let client = EbsClient::new(&client_config);
-            let uploader = SnapshotUploader::new(client);
+            let num_shards = upload_args.client_shards.unwrap_or(1);
+            let uploader = if num_shards <= 1 {
+                SnapshotUploader::new(EbsClient::new(&client_config))
+            } else {
+                debug!("Creating {} EBS client shards", num_shards);
+                let clients = (0..num_shards)
+                    .map(|_| EbsClient::new(&client_config))
+                    .collect();
+                SnapshotUploader::with_client_shards(clients)
+            };
             ensure!(
                 upload_args.file.file_name().is_some(),
                 error::ValidateFilenameSnafu {
@@ -232,8 +244,7 @@ async fn build_client_config(
 
     // The AWS SDK does not set response or per-attempt timeouts by default.
     // Without these, a request that sends its body but never receives a response
-    // will block the upload indefinitely.  This is a known failure mode for EBS
-    // Direct uploads over WAN/non-EC2 network paths (see issues #362, #374).
+    // will block the worker indefinitely.
     config = config
         .timeout_config(
             TimeoutConfig::builder()
@@ -425,6 +436,10 @@ struct UploadArgs {
     #[argh(option)]
     /// number of concurrent upload workers (default: 64)
     workers: Option<usize>,
+
+    #[argh(option)]
+    /// number of independent EBS clients for higher-concurrency uploads (default: 1)
+    client_shards: Option<usize>,
 }
 
 /// Turn a user-specified duration in seconds into a Duration object, for argh parsing.

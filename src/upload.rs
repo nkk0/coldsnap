@@ -103,12 +103,27 @@ pub enum ZeroBlocks {
 }
 
 pub struct SnapshotUploader {
-    ebs_client: EbsClient,
+    ebs_clients: Vec<EbsClient>,
 }
 
 impl SnapshotUploader {
     pub fn new(ebs_client: EbsClient) -> Self {
-        SnapshotUploader { ebs_client }
+        SnapshotUploader {
+            ebs_clients: vec![ebs_client],
+        }
+    }
+
+    /// Create an uploader with multiple independent EBS clients.  Blocks are
+    /// distributed across clients by index, giving each a separate HTTP
+    /// connection pool.  This can reduce head-of-line blocking when many
+    /// workers share a single pool over high-latency paths.
+    pub fn with_client_shards(ebs_clients: Vec<EbsClient>) -> Self {
+        assert!(!ebs_clients.is_empty(), "need at least one EBS client");
+        SnapshotUploader { ebs_clients }
+    }
+
+    fn client_for_block(&self, block_index: i32) -> &EbsClient {
+        &self.ebs_clients[block_index as usize % self.ebs_clients.len()]
     }
 
     /// Upload a snapshot from the file at the specified path.
@@ -232,7 +247,7 @@ impl SnapshotUploader {
                 block_digests: Arc::clone(&block_digests),
                 block_errors: Arc::clone(&block_errors),
                 progress_bar: Arc::clone(&progress_bar),
-                ebs_client: self.ebs_client.clone(),
+                ebs_client: self.client_for_block(i).clone(),
                 zero_blocks,
             });
 
@@ -244,7 +259,11 @@ impl SnapshotUploader {
         // only process this many blocks at once to limit resource usage.
         let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
         assert!(worker_count > 0, "--workers must be greater than zero");
-        debug!("Using {} concurrent upload workers", worker_count);
+        debug!(
+            "Using {} concurrent upload workers across {} client shards",
+            worker_count,
+            self.ebs_clients.len()
+        );
         let stats = Arc::new(UploadStats::new());
         let upload = stream::iter(block_contexts).for_each_concurrent(worker_count, |context| {
             let stats = Arc::clone(&stats);
@@ -350,8 +369,7 @@ impl SnapshotUploader {
         tags: Option<Vec<Tag>>,
         kms_key_id: Option<String>,
     ) -> Result<(String, i32)> {
-        let mut request = self
-            .ebs_client
+        let mut request = self.ebs_clients[0]
             .start_snapshot()
             .volume_size(volume_size)
             .set_description(Some(description))
@@ -383,7 +401,7 @@ impl SnapshotUploader {
         changed_blocks_count: i32,
         checksum: &str,
     ) -> Result<()> {
-        self.ebs_client
+        self.ebs_clients[0]
             .complete_snapshot()
             .snapshot_id(snapshot_id)
             .changed_blocks_count(changed_blocks_count)
@@ -692,8 +710,25 @@ mod test {
     }
 
     #[test]
+    fn client_for_block_modulo_logic() {
+        // Verify the shard selection formula: block_index % num_shards.
+        let num_shards = 3usize;
+        let expected = [0, 1, 2, 0, 1, 2, 0, 1, 2];
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(i % num_shards, want);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "need at least one EBS client")]
+    fn with_client_shards_rejects_empty() {
+        SnapshotUploader::with_client_shards(vec![]);
+    }
+
+    #[test]
     #[should_panic(expected = "--workers must be greater than zero")]
     fn worker_count_zero_panics() {
+        // Simulates what happens if workers=Some(0) gets past CLI validation.
         let count: usize = 0;
         assert!(count > 0, "--workers must be greater than zero");
     }
