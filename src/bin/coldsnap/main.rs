@@ -9,6 +9,8 @@ snapshots.
 use argh::FromArgs;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::default_provider::region::DefaultRegionChain;
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_ebs::types::Tag;
 use aws_sdk_ebs::Client as EbsClient;
 use aws_sdk_ec2::Client as Ec2Client;
@@ -85,6 +87,11 @@ async fn run() -> Result<()> {
         }
 
         SubCommand::Upload(upload_args) => {
+            if upload_args.workers == Some(0) {
+                eprintln!("Error: --workers must be greater than zero");
+                std::process::exit(1);
+            }
+
             let client = EbsClient::new(&client_config);
             let uploader = SnapshotUploader::new(client);
             ensure!(
@@ -115,6 +122,7 @@ async fn run() -> Result<()> {
                     progress_bar?,
                     zero_blocks,
                     upload_args.kms_key_id,
+                    upload_args.workers,
                 )
                 .await
                 .context(error::UploadSnapshotSnafu)?;
@@ -221,6 +229,23 @@ async fn build_client_config(
     if let Some(endpoint) = &endpoint {
         config = config.endpoint_url(endpoint);
     }
+
+    // The AWS SDK does not set response or per-attempt timeouts by default.
+    // Without these, a request that sends its body but never receives a response
+    // will block the upload indefinitely.  This is a known failure mode for EBS
+    // Direct uploads over WAN/non-EC2 network paths (see issues #362, #374).
+    config = config
+        .timeout_config(
+            TimeoutConfig::builder()
+                .read_timeout(Duration::from_secs(12))
+                .operation_attempt_timeout(Duration::from_secs(20))
+                .operation_timeout(Duration::from_secs(120))
+                .build(),
+        )
+        // Disable SDK-level retries; coldsnap already has its own per-block retry
+        // loop with backoff.  Layering SDK retries on top of that leads to excessive
+        // total attempts and unpredictable wall-clock time.
+        .retry_config(RetryConfig::standard().with_max_attempts(1));
 
     config.load().await
 }
@@ -396,6 +421,10 @@ struct UploadArgs {
     #[argh(switch)]
     /// omit blocks of all zeros when uploading
     omit_zero_blocks: bool,
+
+    #[argh(option)]
+    /// number of concurrent upload workers (default: 64)
+    workers: Option<usize>,
 }
 
 /// Turn a user-specified duration in seconds into a Duration object, for argh parsing.

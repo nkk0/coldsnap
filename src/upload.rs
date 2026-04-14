@@ -14,7 +14,7 @@ use base64::Engine as _;
 use bytes::BytesMut;
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
-use log::debug;
+use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::cmp;
@@ -24,7 +24,7 @@ use std::ffi::OsStr;
 use std::io::SeekFrom;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs::{self, File};
@@ -39,13 +39,57 @@ const GIBIBYTE: i64 = 1024 * 1024 * 1024;
 const SNAPSHOT_BLOCK_WORKERS: usize = 64;
 // How long to wait between attempts; this number * attempt number, in seconds.
 const SNAPSHOT_BLOCK_RETRY_SCALE: u64 = 2;
-// 12 retries with scale 2 gives us 132 seconds, chosen because it got past "snapshot does not
-// exist" errors in testing.
-const SNAPSHOT_BLOCK_ATTEMPTS: u64 = 12;
+// 5 retries with scale 2 gives us 20 seconds of backoff. With SDK-level timeouts
+// now in place, each attempt is bounded, so fewer retries are needed.
+const SNAPSHOT_BLOCK_ATTEMPTS: u64 = 5;
 const SNAPSHOT_TIMEOUT_MINUTES: i32 = 10;
 const SHA256_ALGORITHM: ChecksumAlgorithm = ChecksumAlgorithm::ChecksumAlgorithmSha256;
 const LINEAR_METHOD: ChecksumAggregationMethod =
     ChecksumAggregationMethod::ChecksumAggregationLinear;
+
+/// Collects per-block upload latencies for a summary logged after the upload.
+struct UploadStats {
+    buckets: [AtomicU64; 6],
+    errors: AtomicU64,
+}
+
+impl UploadStats {
+    fn new() -> Self {
+        Self {
+            buckets: Default::default(),
+            errors: AtomicU64::new(0),
+        }
+    }
+
+    fn record_success(&self, elapsed: Duration) {
+        let bucket = match elapsed.as_millis() {
+            0..250 => 0,
+            250..500 => 1,
+            500..1000 => 2,
+            1000..2000 => 3,
+            2000..5000 => 4,
+            _ => 5,
+        };
+        self.buckets[bucket].fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn record_error(&self) {
+        self.errors.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn report(&self) {
+        let b: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|a| a.load(AtomicOrdering::Relaxed))
+            .collect();
+        let e = self.errors.load(AtomicOrdering::Relaxed);
+        info!(
+            "Upload complete: <250ms={} 250-500ms={} 500ms-1s={} 1-2s={} 2-5s={} >5s={} errors={}",
+            b[0], b[1], b[2], b[3], b[4], b[5], e
+        );
+    }
+}
 
 /// Specify how blocks of all zeroes should be handled.
 #[derive(Copy, Clone)]
@@ -89,6 +133,7 @@ impl SnapshotUploader {
         progress_bar: Option<ProgressBar>,
         zero_blocks: Option<ZeroBlocks>,
         kms_key_id: Option<String>,
+        workers: Option<usize>,
     ) -> Result<String> {
         let path = path.as_ref();
         let description = description.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -197,30 +242,52 @@ impl SnapshotUploader {
         // Distribute the work across a fixed number of concurrent workers.
         // New threads will be created by the runtime as needed, but we'll
         // only process this many blocks at once to limit resource usage.
-        let upload = stream::iter(block_contexts).for_each_concurrent(
-            SNAPSHOT_BLOCK_WORKERS,
-            |context| async move {
+        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
+        assert!(worker_count > 0, "--workers must be greater than zero");
+        debug!("Using {} concurrent upload workers", worker_count);
+        let stats = Arc::new(UploadStats::new());
+        let upload = stream::iter(block_contexts).for_each_concurrent(worker_count, |context| {
+            let stats = Arc::clone(&stats);
+            async move {
                 for attempt in 0..SNAPSHOT_BLOCK_ATTEMPTS {
-                    // Increasing wait between attempts.  (No wait to start, on 0th attempt.)
-                    time::sleep(Duration::from_secs(attempt * SNAPSHOT_BLOCK_RETRY_SCALE)).await;
+                    if attempt > 0 {
+                        let backoff = Duration::from_secs(attempt * SNAPSHOT_BLOCK_RETRY_SCALE);
+                        debug!(
+                            "block {}: retry {}/{}, backoff {}s",
+                            context.block_index,
+                            attempt,
+                            SNAPSHOT_BLOCK_ATTEMPTS,
+                            backoff.as_secs()
+                        );
+                        time::sleep(backoff).await;
+                    }
 
+                    let start = std::time::Instant::now();
                     let block_result = self.upload_block(&context).await;
+                    let elapsed = start.elapsed();
+
                     let mut block_errors = context.block_errors.lock().expect("poisoned");
                     if let Err(e) = block_result {
-                        debug!(
-                            "Error uploading block, attempt {} of {}",
+                        stats.record_error();
+                        warn!(
+                            "block {}: attempt {}/{} failed after {:.1}s: {}",
+                            context.block_index,
                             attempt + 1,
-                            SNAPSHOT_BLOCK_ATTEMPTS
+                            SNAPSHOT_BLOCK_ATTEMPTS,
+                            elapsed.as_secs_f64(),
+                            e
                         );
                         block_errors.insert(context.block_index, e);
                         continue;
                     }
+                    stats.record_success(elapsed);
                     block_errors.remove(&context.block_index);
                     break;
                 }
-            },
-        );
+            }
+        });
         upload.await;
+        stats.report();
 
         // At this point, all the concurrent jobs have finished, so all of the Arcs we copied have
         // been dropped. Hence there's exactly one strong reference and it's safe to `try_unwrap`
@@ -577,5 +644,57 @@ mod error {
             right_number: String,
             target: String,
         },
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn histogram_bucket_boundaries() {
+        let stats = UploadStats::new();
+
+        stats.record_success(Duration::from_millis(0));
+        stats.record_success(Duration::from_millis(249));
+        stats.record_success(Duration::from_millis(250));
+        stats.record_success(Duration::from_millis(499));
+        stats.record_success(Duration::from_millis(500));
+        stats.record_success(Duration::from_millis(999));
+        stats.record_success(Duration::from_millis(1000));
+        stats.record_success(Duration::from_millis(1999));
+        stats.record_success(Duration::from_millis(2000));
+        stats.record_success(Duration::from_millis(4999));
+        stats.record_success(Duration::from_millis(5000));
+        stats.record_success(Duration::from_millis(60000));
+
+        let b: Vec<u64> = stats
+            .buckets
+            .iter()
+            .map(|a| a.load(AtomicOrdering::Relaxed))
+            .collect();
+
+        assert_eq!(b[0], 2); // <250ms: 0, 249
+        assert_eq!(b[1], 2); // 250-500ms: 250, 499
+        assert_eq!(b[2], 2); // 500ms-1s: 500, 999
+        assert_eq!(b[3], 2); // 1-2s: 1000, 1999
+        assert_eq!(b[4], 2); // 2-5s: 2000, 4999
+        assert_eq!(b[5], 2); // >5s: 5000, 60000
+    }
+
+    #[test]
+    fn error_counter() {
+        let stats = UploadStats::new();
+        stats.record_error();
+        stats.record_error();
+        stats.record_error();
+        assert_eq!(stats.errors.load(AtomicOrdering::Relaxed), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "--workers must be greater than zero")]
+    fn worker_count_zero_panics() {
+        let count: usize = 0;
+        assert!(count > 0, "--workers must be greater than zero");
     }
 }
